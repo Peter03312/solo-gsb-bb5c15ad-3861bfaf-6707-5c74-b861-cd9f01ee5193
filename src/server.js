@@ -2530,6 +2530,101 @@ app.get('/api/combo-orders/:comboId/issues', (req, res) => {
   });
 });
 
+// ---------- 库存台账（按规格追溯实物库存与净预留的逐笔去向） ----------
+
+const LEDGER_EVENT_TEXT = {
+  baseline: '启用台账基线',
+  register: '登记规格',
+  adjust: '手工调库',
+  plan_confirm: '铅条计划确认',
+  plan_cancel: '铅条计划取消',
+  order_confirm: '裁片订单确认',
+  order_cancel: '裁片订单取消',
+  replace_out: '换单·旧单退出',
+  replace_in: '换单·新单接替',
+  combo_confirm: '整套单确认',
+  combo_cancel: '整套单取消',
+  stocktake: '盘点确认',
+  issue: '领料出库',
+};
+
+// 解析时间边界：支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS（空格或 T 分隔）。
+// from 缺省时分秒按 00:00:00 起；to 缺省按 23:59:59 / 当分 :59 止（区间右闭）。非法返回 null。
+function parseLedgerTime(raw, isEnd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(String(raw).trim());
+  if (!m) return null;
+  const [, Y, Mo, D, H, Mi, S] = m;
+  if (Number(Mo) < 1 || Number(Mo) > 12 || Number(D) < 1 || Number(D) > 31) return null;
+  if (H !== undefined && (Number(H) > 23 || Number(Mi) > 59 || (S !== undefined && Number(S) > 59))) {
+    return null;
+  }
+  const day = `${Y}-${Mo}-${D}`;
+  if (H === undefined) return `${day} ${isEnd ? '23:59:59' : '00:00:00'}`;
+  return `${day} ${H}:${Mi}:${S !== undefined ? S : (isEnd ? '59' : '00')}`;
+}
+
+// GET /api/ledger?type=lead|glass&specId=N&from=...&to=...
+// 逐笔返回：发生时间、业务来源、实物库存与净预留的增减及笔后余额（按发生顺序升序）。
+// 无记录返回空 entries；非法筛选明确报错（400/404）。
+app.get('/api/ledger', (req, res) => {
+  const q = req.query || {};
+  const type = q.type;
+  if (type !== 'lead' && type !== 'glass') {
+    return fail(res, 400, '材料类型 type 必须是 lead（铅条原材）或 glass（玻璃原片）');
+  }
+  const specId = Number(q.specId);
+  if (!Number.isInteger(specId) || specId <= 0) {
+    return fail(res, 400, 'specId 必须是规格的正整数 id');
+  }
+  const spec = type === 'lead' ? db.getMaterial(specId) : db.getGlassSheet(specId);
+  if (!spec) {
+    return fail(res, 404, type === 'lead' ? `铅条原材规格 #${specId} 不存在` : `玻璃原片规格 #${specId} 不存在`);
+  }
+  let from = null;
+  let to = null;
+  if (q.from !== undefined && q.from !== '') {
+    from = parseLedgerTime(q.from, false);
+    if (!from) return fail(res, 400, 'from 时间格式非法：支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]');
+  }
+  if (q.to !== undefined && q.to !== '') {
+    to = parseLedgerTime(q.to, true);
+    if (!to) return fail(res, 400, 'to 时间格式非法：支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]');
+  }
+  if (from && to && from > to) {
+    return fail(res, 400, `起始时间不能晚于结束时间（from=${from}，to=${to}）`);
+  }
+  const rows = db.listLedgerEntries({ materialType: type, specId, from, to });
+  const entries = rows.map((r) => ({
+    id: r.id,
+    occurredAt: r.created_at,
+    eventType: r.event_type,
+    eventText: LEDGER_EVENT_TEXT[r.event_type] || r.event_type,
+    sourceType: r.source_type,
+    sourceId: r.source_id,
+    sourceLabel: r.source_label,
+    deltaStock: r.delta_stock,
+    deltaReserved: r.delta_reserved,
+    balanceStock: r.balance_stock,
+    balanceReserved: r.balance_reserved,
+  }));
+  res.json({
+    ok: true,
+    ledger: {
+      materialType: type,
+      materialTypeText: type === 'lead' ? '铅条原材' : '玻璃原片',
+      specId,
+      specName: type === 'lead' ? spec.name : spec.color,
+      specDetail: type === 'lead' ? `定尺 ${spec.length} mm` : `${spec.width}×${spec.height} mm`,
+      unit: type === 'lead' ? '根' : '张',
+      from,
+      to,
+      current: { stock: spec.stock, reserved: spec.reserved, available: spec.available },
+      count: entries.length,
+      entries,
+    },
+  });
+});
+
 // 前端单页
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));

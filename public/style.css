@@ -271,6 +271,7 @@ td.added.num, th.added.num { color: #2e7d4f; }
 .badge.replace { background: #e7f0ff; color: #1c5dc4; }
 .stock-badge.replace { background: #e7f0ff; color: #1c5dc4; border: 1px solid #9db8e8; }
 .ok-text { color: var(--ok); font-weight: 600; }
+.neg-text { color: var(--danger); font-weight: 600; }
 .replace-panel {
   margin-top: 14px;
   border: 1px dashed #9db8e8;

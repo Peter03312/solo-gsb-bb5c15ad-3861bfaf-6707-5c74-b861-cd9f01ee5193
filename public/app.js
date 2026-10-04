@@ -714,6 +714,7 @@ function switchTab(which) {
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
   document.getElementById('tabIssue').classList.toggle('active', which === 'issue');
+  document.getElementById('tabLedger').classList.toggle('active', which === 'ledger');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
@@ -723,6 +724,7 @@ function switchTab(which) {
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
   document.getElementById('viewIssue').hidden = which !== 'issue';
+  document.getElementById('viewLedger').hidden = which !== 'ledger';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
@@ -731,6 +733,7 @@ function switchTab(which) {
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
   if (which === 'issue') enterIssue();
+  if (which === 'ledger') enterLedger();
 }
 
 (async function init() {
@@ -2986,3 +2989,110 @@ document.getElementById('btnIssueSubmit').addEventListener('click', () => { issu
 document.getElementById('btnIssueNewNo').addEventListener('click', () => {
   document.getElementById('issueNo').value = genIssueNo();
 });
+
+// ================= 库存台账（按规格追溯实物库存与净预留） =================
+
+const ledger = {
+  type: 'lead',
+  specs: [],
+  result: null,
+};
+
+function ledgerBanner(kind, msg) {
+  const b = document.getElementById('ledgerBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+}
+
+async function enterLedger() {
+  ledgerBanner(false);
+  try {
+    await ledgerLoadSpecs();
+  } catch (err) {
+    ledgerBanner('error', '⛔ ' + (err.data?.error || err.message));
+  }
+}
+
+async function ledgerLoadSpecs() {
+  ledger.type = document.getElementById('ledgerType').value;
+  const data = await api('GET', ledger.type === 'lead' ? '/api/materials' : '/api/glass-sheets');
+  ledger.specs = ledger.type === 'lead' ? data.materials : data.sheets;
+  const sel = document.getElementById('ledgerSpec');
+  if (!ledger.specs.length) {
+    sel.innerHTML = '<option value="">（暂无已登记规格）</option>';
+    return;
+  }
+  sel.innerHTML = ledger.specs.map((s) => {
+    const label = ledger.type === 'lead'
+      ? `#${s.id} ${s.name}（定尺 ${fmt(s.length)}mm · 库存 ${s.stock} / 净预留 ${s.reserved}）`
+      : `#${s.id} ${s.color}（${s.width}×${s.height}mm · 库存 ${s.stock} / 净预留 ${s.reserved}）`;
+    return `<option value="${s.id}">${escapeHtml(label)}</option>`;
+  }).join('');
+}
+
+async function ledgerQuery() {
+  const specId = Number(document.getElementById('ledgerSpec').value);
+  if (!specId) { ledgerBanner('error', '⛔ 请先登记并选择要追溯的规格'); return; }
+  const params = new URLSearchParams({ type: ledger.type, specId: String(specId) });
+  const fromRaw = document.getElementById('ledgerFrom').value;
+  const toRaw = document.getElementById('ledgerTo').value;
+  if (fromRaw) params.set('from', fromRaw.replace('T', ' '));
+  if (toRaw) params.set('to', toRaw.replace('T', ' '));
+  try {
+    const data = await api('GET', `/api/ledger?${params.toString()}`);
+    ledger.result = data.ledger;
+    ledgerRender();
+    ledgerBanner(false);
+  } catch (err) {
+    ledgerBanner('error', '⛔ ' + (err.data?.error || err.message));
+  }
+}
+
+function ledgerDeltaHtml(n) {
+  const cls = n > 0 ? 'ok-text' : n < 0 ? 'neg-text' : 'muted';
+  return `<td class="num ${cls}">${n > 0 ? `+${n}` : n}</td>`;
+}
+
+function ledgerRender() {
+  const L = ledger.result;
+  if (!L) return;
+  document.getElementById('ledgerCurrentSection').hidden = false;
+  document.getElementById('ledgerCurrent').innerHTML =
+    `<div class="stock-badge ok">${escapeHtml(L.materialTypeText)} ${escapeHtml(L.specName)}
+      <span class="muted small">${escapeHtml(L.specDetail)}</span><br>
+      实物库存 <b>${L.current.stock}</b> ${L.unit} · 净预留 <b>${L.current.reserved}</b> · 可用 <b>${L.current.available}</b>
+    </div>`;
+  const el = document.getElementById('ledgerTable');
+  if (!L.entries.length) {
+    el.innerHTML = '<div class="hint">该条件下暂无台账记录（换个时间范围或规格试试）。</div>';
+    return;
+  }
+  let html = `<div class="hint">共 ${L.count} 笔，按发生顺序排列；笔后余额可与当前结存逐笔核对。</div>
+    <table><thead><tr>
+      <th>#</th><th>发生时间</th><th>业务来源</th><th>事件</th>
+      <th class="num">实物增减</th><th class="num">净预留增减</th>
+      <th class="num">笔后实物</th><th class="num">笔后净预留</th>
+    </tr></thead><tbody>`;
+  for (const e of L.entries) {
+    html += `<tr>
+      <td class="muted">${e.id}</td>
+      <td>${escapeHtml(e.occurredAt)}</td>
+      <td>${escapeHtml(e.sourceLabel)}</td>
+      <td>${escapeHtml(e.eventText)}</td>
+      ${ledgerDeltaHtml(e.deltaStock)}
+      ${ledgerDeltaHtml(e.deltaReserved)}
+      <td class="num"><b>${e.balanceStock}</b></td>
+      <td class="num"><b>${e.balanceReserved}</b></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+document.getElementById('tabLedger').addEventListener('click', () => switchTab('ledger'));
+document.getElementById('ledgerType').addEventListener('change', () => {
+  ledgerLoadSpecs().catch((e) => ledgerBanner('error', '⛔ ' + (e.data?.error || e.message)));
+});
+document.getElementById('btnLedgerQuery').addEventListener('click', () => { ledgerQuery(); });
