@@ -2530,6 +2530,98 @@ app.get('/api/combo-orders/:comboId/issues', (req, res) => {
   });
 });
 
+// 库存台账查询：按材料类型 + 规格 + 时间范围逐笔追溯实物库存与净预留的增减及笔后余额。
+// type 必填（lead=铅条原材 / glass=玻璃原片）；specId 必填且必须为已存在的该类型规格；
+// from/to 可空，格式 'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM:SS'（UTC）；无记录返回空结果，非法筛选 400/404。
+const LEDGER_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?$/;
+
+// 解析台账时间筛选：日期按 UTC 当天整天，日期时间按该 UTC 时刻；非法返回 { error }。
+function parseLedgerTime(value, { end = false } = {}) {
+  if (value === undefined || value === null || value === '') return { ok: true, value: null };
+  if (typeof value !== 'string') return { ok: false, error: '时间格式必须是 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（UTC）' };
+  const m = LEDGER_DATE_RE.exec(value.trim());
+  if (!m) return { ok: false, error: '时间格式必须是 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（UTC）' };
+  const [, y, mo, da, hh, mi, ss] = m;
+  const hasTime = hh !== undefined;
+  const dt = new Date(Date.UTC(+y, +mo - 1, +da, hasTime ? +hh : 0, hasTime ? +mi : 0, hasTime ? +ss : 0));
+  if (Number.isNaN(dt.getTime()) ||
+    dt.getUTCFullYear() !== +y || dt.getUTCMonth() !== +mo - 1 || dt.getUTCDate() !== +da ||
+    (hasTime && (dt.getUTCHours() !== +hh || dt.getUTCMinutes() !== +mi || dt.getUTCSeconds() !== +ss))) {
+    return { ok: false, error: '时间不是合法日期（YYYY-MM-DD[ HH:MM:SS]，UTC）' };
+  }
+  const pad = (n) => String(n).padStart(2, '0');
+  let text = `${y}-${mo}-${da}`;
+  if (hasTime) {
+    text += ` ${hh}:${mi}:${ss}`;
+  } else {
+    text += end ? ' 23:59:59' : ' 00:00:00';
+  }
+  return { ok: true, value: text };
+}
+
+app.get('/api/stock-ledger', (req, res) => {
+  const q = req.query || {};
+  const type = q.type;
+  if (type !== 'lead' && type !== 'glass') {
+    return fail(res, 400, 'type 必填且必须是 lead（铅条原材）或 glass（玻璃原片）');
+  }
+  const specId = Number(q.specId);
+  if (!Number.isInteger(specId) || specId <= 0) {
+    return fail(res, 400, 'specId 必填且必须是正整数（规格 id）');
+  }
+  const from = parseLedgerTime(q.from);
+  if (!from.ok) return fail(res, 400, `from ${from.error}`);
+  const to = parseLedgerTime(q.to, { end: true });
+  if (!to.ok) return fail(res, 400, `to ${to.error}`);
+  if (from.value && to.value && from.value > to.value) {
+    return fail(res, 400, '时间范围非法：from 不得晚于 to');
+  }
+
+  let spec;
+  if (type === 'lead') {
+    spec = db.getMaterial(specId);
+    if (!spec) return fail(res, 404, '铅条原材规格不存在');
+  } else {
+    spec = db.getGlassSheet(specId);
+    if (!spec) return fail(res, 404, '玻璃原片规格不存在');
+  }
+
+  const entries = db.listStockLedger({ specType: type, specId, from: from.value, to: to.value });
+  const opening = db.ledgerOpening({ specType: type, specId, from: from.value });
+  const current = { stock: spec.stock, reserved: spec.reserved, available: spec.available };
+  // 顺序核对：最后一笔笔后余额应等于当前实物库存与净预留
+  const tail = entries[entries.length - 1];
+  const tailMatches = tail
+    ? tail.stockBalance === current.stock && tail.reserveBalance === current.reserved
+    : opening.stock === current.stock && opening.reserved === current.reserved;
+  // 区间内逐笔滚动核对：每笔笔后余额 = 上一笔笔后余额 + 本笔增减
+  let running = { ...opening };
+  let sequential = true;
+  for (const e of entries) {
+    if (e.stockBalance !== running.stock + e.stockChange ||
+        e.reserveBalance !== running.reserved + e.reserveChange) {
+      sequential = false;
+      break;
+    }
+    running = { stock: e.stockBalance, reserved: e.reserveBalance };
+  }
+  res.json({
+    ok: true,
+    filter: { type, specId, from: from.value, to: to.value },
+    spec: {
+      id: spec.id, type,
+      name: spec.name, length: spec.length,
+      color: spec.color, width: spec.width, height: spec.height,
+      createdAt: spec.createdAt,
+    },
+    opening,
+    entries,
+    current,
+    tailMatches,
+    sequential,
+  });
+});
+
 // 前端单页
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));

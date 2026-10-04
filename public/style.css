@@ -317,3 +317,17 @@ td.added.num, th.added.num { color: #2e7d4f; }
   padding: 1px 6px;
   border-radius: 4px;
 }
+
+/* ============ 库存台账 ============ */
+.ledger-table { margin-top: 8px; font-size: 12.5px; }
+.ledger-table th, .ledger-table td { padding: 6px 8px; border-bottom: 1px solid #ececf0; text-align: left; vertical-align: top; }
+.ledger-table th { background: #f6f6f9; position: sticky; top: 0; }
+.ledger-table td.num, .ledger-table th.num { text-align: right; white-space: nowrap; }
+.ledger-table .ledger-ref { color: #444; max-width: 320px; }
+.ledger-table .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
+.badge.neutral { background: #eef0f3; color: #555c66; }
+.badge.warn { background: #fff2e0; color: #9a5a06; }
+.delta-up { color: var(--ok, #1e5e36); }
+.delta-down { color: var(--danger, #c0392b); }
+.ledger-current { line-height: 1.9; font-size: 13px; }
+#viewLedger select { max-width: 100%; }

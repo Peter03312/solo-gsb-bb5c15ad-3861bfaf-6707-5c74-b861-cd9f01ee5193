@@ -19,6 +19,7 @@
       <button id="tabCombo" class="tab">整套备料</button>
       <button id="tabStocktake" class="tab">库存盘点</button>
       <button id="tabIssue" class="tab">领料</button>
+      <button id="tabLedger" class="tab">库存台账</button>
     </nav>
   </header>
 
@@ -469,6 +470,47 @@
       <div class="lead-panel">
         <h2>单据剩余预留 / 领料详情</h2>
         <div id="issueDetail" class="hint">在左侧选择已确认单据，查看各规格尚未领出的预留量并分次领料。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 库存台账视图 ============ -->
+  <main id="viewLedger" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>库存台账追溯</h2>
+        <div class="hint">按规格逐笔追溯铅条原材/玻璃原片的<b>实物库存</b>与<b>净预留</b>（尚未领出的预留）增减及笔后余额。
+          台账首次启用时仅按各规格当前库存与净预留建立一笔基线，不倒推旧业务；新登记规格从登记余额起记账。</div>
+        <label>材料类型
+          <select id="ledgerType">
+            <option value="lead">铅条原材</option>
+            <option value="glass">玻璃原片</option>
+          </select>
+        </label>
+        <label>规格
+          <select id="ledgerSpec"></select>
+        </label>
+        <div class="form-row two">
+          <label>开始日期（UTC，可空）<input id="ledgerFrom" type="date"></label>
+          <label>结束日期（UTC，可空）<input id="ledgerTo" type="date"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnLedgerQuery" class="primary big">查询台账</button>
+        </div>
+        <div id="ledgerMsg" class="hint">日期可只填一边；时间按 UTC 当天整天过滤（也可用精确时刻调用 API）。无记录返回空结果。</div>
+      </section>
+
+      <section>
+        <h2>当前口径</h2>
+        <div id="ledgerCurrent" class="hint">选择材料类型与规格后点击“查询台账”。</div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="ledgerBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>逐笔流水（可顺序核对至当前余额）</h2>
+        <div id="ledgerResult" class="hint">在左侧选择材料类型、规格与时间范围后查询。</div>
       </div>
     </section>
   </main>

@@ -237,6 +237,59 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_issues_mat    ON stock_issues(material_id);
     CREATE INDEX IF NOT EXISTS idx_issues_sheet  ON stock_issues(sheet_id);
     CREATE INDEX IF NOT EXISTS idx_issues_no     ON stock_issues(issue_no);
+
+    -- 库存台账：逐笔记录每个规格（铅条原材 / 玻璃原片）的实物库存与净预留增减及笔后余额。
+    -- 每一笔都与引发它的业务在同一事务内写入（登记/调库/单据确认取消/换单/盘点/领料），
+    -- 失败回滚与幂等重试天然不会留下重复流水。
+    -- spec_type='lead' 规格为 lead_materials.id；'glass' 为 glass_sheets.id（规格从不删除）。
+    -- stock_change/reserve_change 为带符号增减；stock_balance/reserve_balance 为笔后余额。
+    -- event_type:
+    --   baseline        台账首次启用基线（仅旧库首次启用时每规格一笔，不倒推旧业务）
+    --   register        新规格登记（从登记余额起记账）
+    --   adjust          手工调库（PATCH 库存）
+    --   plan_confirm    独立铅条计划确认（净预留 +）
+    --   plan_cancel     独立铅条计划取消（净预留 -）
+    --   order_confirm   独立裁片订单确认（逐色，净预留 +）
+    --   order_cancel    独立裁片订单取消（逐色，净预留 -）
+    --   replace_release 裁片换单：旧单退出预留（净预留 -）
+    --   replace_reserve 裁片换单：新单承接预留（净预留 +）
+    --   combo_confirm   整套单确认（铅条 +、逐色玻璃 +）
+    --   combo_cancel    整套单取消（铅条 -、逐色玻璃 -）
+    --   stocktake       盘点确认（实物库存调整，净预留不变）
+    --   issue           领料确认（实物库存与净预留同减）
+    -- event_id 为同一业务事件（可能涉及多个规格，如整套确认/换单/领料）共享的分组号：
+    -- 查询按 (occurred_at, COALESCE(event_id,id), seq) 排序，使同事件内各规格流水各自连续，
+    -- 保证每个规格都能“逐笔滚动余额”顺序核对（不同规格的事件行不会在同一规格内交错）。
+    CREATE TABLE IF NOT EXISTS stock_ledger (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id         INTEGER,                 -- 业务事件分组号（同事件多行共享，取该事件首行 id）
+      spec_type        TEXT    NOT NULL CHECK (spec_type IN ('lead','glass')),
+      spec_id          INTEGER NOT NULL,
+      spec_name        TEXT    NOT NULL,       -- 规格名（铅条）/ 颜色（玻璃），笔发生时快照
+      spec_length_h    INTEGER,                -- 仅铅条：定尺（厘），身份快照
+      spec_width_mm    INTEGER,                -- 仅玻璃：宽（mm）
+      spec_height_mm   INTEGER,                -- 仅玻璃：高（mm）
+      occurred_at      TEXT    NOT NULL DEFAULT (datetime('now')),  -- 发生时间（UTC，精确到秒）
+      event_type       TEXT    NOT NULL,
+      source_type      TEXT,                   -- plan/order/replacement/combo/stocktake/issue/register/adjust/baseline
+      source_id        INTEGER,                -- 业务来源单据 id（领料为 NULL，用 source_ref 记领料号）
+      source_ref       TEXT,                   -- 业务来源描述（如“生产计划 #5 确认”、“领料 LL-001”）
+      stock_change     INTEGER NOT NULL,       -- 实物库存增减（0 表示本笔不涉及实物）
+      reserve_change   INTEGER NOT NULL,       -- 净预留增减（0 表示本笔不涉及净预留）
+      stock_balance    INTEGER NOT NULL,       -- 笔后实物库存
+      reserve_balance  INTEGER NOT NULL,       -- 笔后净预留（尚未领出的预留）
+      seq              INTEGER NOT NULL DEFAULT 1  -- 同一业务事件内该规格行序（1 起，确定性排序）
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ledger_spec
+      ON stock_ledger(spec_type, spec_id, occurred_at, event_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_ledger_event ON stock_ledger(event_type);
+
+    -- 应用级元信息：记录台账基线是否已在本库建立（仅旧库首次启用时建立一次）。
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key    TEXT PRIMARY KEY,
+      value  TEXT NOT NULL
+    );
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -255,6 +308,10 @@ function init(dbPath) {
 
   // 早期领料表 issue_no 带 UNIQUE（一次领料多行需同号）；检测到旧定义则重建。
   migrateStockIssues();
+
+  // 台账首次启用：旧库已有规格时按“当前实物库存 + 当前净预留”逐规格建立基线，
+  // 不倒推旧业务；新库（空库）只打已启用标记，此后登记的规格从登记余额起记账。
+  establishLedgerBaseline();
 
   return db;
 }
@@ -345,6 +402,151 @@ function migrateCutOrders() {
 function getDb() {
   if (!db) throw new Error('数据库未初始化');
   return db;
+}
+
+// ---------- 库存台账（stock_ledger） ----------
+//
+// 口径：每个规格（铅条原材 / 玻璃原片）逐笔记“实物库存、净预留”的带符号增减与笔后余额。
+// 所有写台账的业务都在同一个 BEGIN IMMEDIATE 事务内完成业务变更与台账写入；
+// 业务失败回滚时台账一并回滚；幂等重试在写台账之前就返回原结果，故不会留下重复流水。
+// 旧库首次启用时仅按各规格“当前实物库存 + 当前净预留”建立一笔基线，不倒推旧业务。
+
+// 台账首次启用基线（幂等：app_meta 中 ledger_baseline_at 已存在则跳过）。
+function establishLedgerBaseline() {
+  const d = db;
+  const mark = d.prepare("SELECT value FROM app_meta WHERE key = 'ledger_baseline_at'").get();
+  if (mark) return;
+  const txn = d.transaction(() => {
+    const at = d.prepare("SELECT datetime('now') AS t").get().t;
+    const leadRows = d.prepare('SELECT * FROM lead_materials ORDER BY id').all();
+    for (const m of leadRows) {
+      const gross = d
+        .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
+        .get(m.id).n;
+      const reserved = gross - d
+        .prepare('SELECT COALESCE(SUM(lead_bars),0) AS n FROM stock_issues WHERE material_id = ?')
+        .get(m.id).n;
+      d.prepare(`INSERT INTO stock_ledger
+        (spec_type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+         occurred_at, event_type, source_type, source_id, source_ref,
+         stock_change, reserve_change, stock_balance, reserve_balance, seq)
+        VALUES ('lead', ?, ?, ?, NULL, NULL, ?, 'baseline', 'baseline', NULL, ?,
+                0, 0, ?, ?, 1)`)
+        .run(m.id, m.name, m.length_h, at, '台账启用基线（按当前实物库存与净预留建立，不倒推旧业务）',
+          m.stock, reserved);
+    }
+    const glassRows = d.prepare('SELECT * FROM glass_sheets ORDER BY id').all();
+    for (const s of glassRows) {
+      const gross = d
+        .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
+                  FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
+                  WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(s.id).n;
+      const reserved = gross - d
+        .prepare('SELECT COALESCE(SUM(sheets_count),0) AS n FROM stock_issues WHERE sheet_id = ?')
+        .get(s.id).n;
+      d.prepare(`INSERT INTO stock_ledger
+        (spec_type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+         occurred_at, event_type, source_type, source_id, source_ref,
+         stock_change, reserve_change, stock_balance, reserve_balance, seq)
+        VALUES ('glass', ?, ?, NULL, ?, ?, ?, 'baseline', 'baseline', NULL, ?,
+                0, 0, ?, ?, 1)`)
+        .run(s.id, s.color, s.width_mm, s.height_mm, at,
+          '台账启用基线（按当前实物库存与净预留建立，不倒推旧业务）', s.stock, reserved);
+    }
+    d.prepare("INSERT INTO app_meta (key, value) VALUES ('ledger_baseline_at', ?)").run(at);
+  });
+  txn.immediate();
+}
+
+// 事务内开始一个台账业务事件：返回 eventId（取事件首行 id）。
+// 同一业务事件（可能涉及多个规格）的所有流水共用 eventId，使各规格流水在查询时各自连续。
+function beginLedgerEvent(d) {
+  const cur = d.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS nextId FROM stock_ledger').get().nextId;
+  return cur;
+}
+
+// 事务内追加一笔台账流水。specType: 'lead'|'glass'；event: 见 stock_ledger.event_type 注释。
+// delta: { stockChange, reserveChange }；balances 为笔后余额（业务变更后、同一事务内计算）。
+// 必须在写事务中调用；eventId 为业务事件分组号，seq 为同事件内该规格行序（缺省 1）。
+function appendLedgerInTx(d, specType, specId, event, payload, delta, balances, seq = 1, eventId = null) {
+  const p = payload || {};
+  if (specType === 'lead') {
+    const m = d.prepare('SELECT * FROM lead_materials WHERE id = ?').get(specId);
+    d.prepare(`INSERT INTO stock_ledger
+      (event_id, spec_type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+       event_type, source_type, source_id, source_ref,
+       stock_change, reserve_change, stock_balance, reserve_balance, seq)
+      VALUES (?, 'lead', ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(eventId, specId, p.specName !== undefined ? p.specName : (m ? m.name : `规格 #${specId}`),
+        p.specLengthH !== undefined ? p.specLengthH : (m ? m.length_h : null),
+        event, p.sourceType ?? null, p.sourceId ?? null, p.sourceRef ?? null,
+        delta.stockChange, delta.reserveChange,
+        balances.stock, balances.reserved, seq);
+  } else {
+    const s = d.prepare('SELECT * FROM glass_sheets WHERE id = ?').get(specId);
+    d.prepare(`INSERT INTO stock_ledger
+      (event_id, spec_type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+       event_type, source_type, source_id, source_ref,
+       stock_change, reserve_change, stock_balance, reserve_balance, seq)
+      VALUES (?, 'glass', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(eventId, specId, p.specName !== undefined ? p.specName : (s ? s.color : `规格 #${specId}`),
+        p.specWidthMm !== undefined ? p.specWidthMm : (s ? s.width_mm : null),
+        p.specHeightMm !== undefined ? p.specHeightMm : (s ? s.height_mm : null),
+        event, p.sourceType ?? null, p.sourceId ?? null, p.sourceRef ?? null,
+        delta.stockChange, delta.reserveChange,
+        balances.stock, balances.reserved, seq);
+  }
+}
+
+function rowToLedger(r) {
+  return {
+    id: r.id,
+    eventId: r.event_id,
+    specType: r.spec_type,
+    specId: r.spec_id,
+    specName: r.spec_name,
+    specLength: r.spec_length_h === null ? null : r.spec_length_h / 100,
+    specWidth: r.spec_width_mm,
+    specHeight: r.spec_height_mm,
+    occurredAt: r.occurred_at,
+    eventType: r.event_type,
+    sourceType: r.source_type,
+    sourceId: r.source_id,
+    sourceRef: r.source_ref,
+    stockChange: r.stock_change,
+    reserveChange: r.reserve_change,
+    stockBalance: r.stock_balance,
+    reserveBalance: r.reserve_balance,
+    seq: r.seq,
+  };
+}
+
+// 按规格 + 时间范围（可选）逐笔查询台账；按发生顺序返回，可顺序核对至当前余额。
+// 排序 (occurred_at, event_id, seq)：同一业务事件涉及多规格时，各规格只看到自己的行，
+// 且用 event_id 保证事件行在该规格序列中连续（不会被其他规格的行按全局 id 交错）。
+// from/to 为 'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM:SS'（UTC），由调用方完成合法性校验。
+function listStockLedger({ specType, specId, from, to }) {
+  const where = ['spec_type = ?', 'spec_id = ?'];
+  const args = [specType, specId];
+  if (from) { where.push("occurred_at >= ?"); args.push(from); }
+  if (to) { where.push("occurred_at <= ?"); args.push(to); }
+  return getDb()
+    .prepare(`SELECT * FROM stock_ledger WHERE ${where.join(' AND ')}
+              ORDER BY occurred_at, COALESCE(event_id, id), seq, id`)
+    .all(...args)
+    .map(rowToLedger);
+}
+
+// 某规格台账首笔之前的余额（恒为 0；台账从基线/登记起记账）。
+function ledgerOpening({ specType, specId, from }) {
+  if (!from) return { stock: 0, reserved: 0 };
+  const r = getDb()
+    .prepare(`SELECT stock_balance AS stock, reserve_balance AS reserved
+              FROM stock_ledger
+              WHERE spec_type = ? AND spec_id = ? AND occurred_at < ?
+              ORDER BY occurred_at DESC, COALESCE(event_id, id) DESC, seq DESC, id DESC LIMIT 1`)
+    .get(specType, specId, from);
+  return r || { stock: 0, reserved: 0 };
 }
 
 // ---------- designs ----------
@@ -557,14 +759,25 @@ function getMaterialByName(name) {
 }
 
 function createMaterial({ name, lengthH, stock }) {
-  const info = getDb()
-    .prepare('INSERT INTO lead_materials (name, length_h, stock) VALUES (?, ?, ?)')
-    .run(name, lengthH, stock);
-  return getMaterial(info.lastInsertRowid);
+  const d = getDb();
+  const txn = d.transaction(() => {
+    const info = d
+      .prepare('INSERT INTO lead_materials (name, length_h, stock) VALUES (?, ?, ?)')
+      .run(name, lengthH, stock);
+    const id = info.lastInsertRowid;
+    // 新登记规格从登记余额起记账（实物=登记库存，净预留=0）
+    appendLedgerInTx(d, 'lead', id, 'register', {
+      sourceType: 'register', sourceRef: `原材登记「${name}」`,
+    }, { stockChange: stock, reserveChange: 0 }, { stock, reserved: 0 });
+    return id;
+  });
+  const id = txn.immediate();
+  return getMaterial(id);
 }
 
 // 仅允许改名称与库存根数（定尺属于规格身份，改定尺请新建规格）。
 // 库存校验在事务中完成：不得小于已预留根数，库存永不为负由 CHECK 兜底。
+// 调库与台账写入在同一事务；仅改名不产生台账流水。
 function updateMaterial(id, { name, stock }) {
   const d = getDb();
   const txn = d.transaction(() => {
@@ -582,8 +795,13 @@ function updateMaterial(id, { name, stock }) {
       if (dup) return { code: 'name_taken' };
       d.prepare("UPDATE lead_materials SET name = ?, updated_at = datetime('now') WHERE id = ?").run(name, id);
     }
-    if (stock !== undefined) {
+    if (stock !== undefined && stock !== row.stock) {
       d.prepare("UPDATE lead_materials SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
+      const cur = getMaterialRow(id);
+      appendLedgerInTx(d, 'lead', id, 'adjust', {
+        sourceType: 'adjust', sourceRef: '手工调库（铅条原材）',
+      }, { stockChange: stock - row.stock, reserveChange: 0 },
+      { stock: cur.stock, reserved });
     }
     return { code: 'ok', material: getMaterial(id) };
   });
@@ -697,6 +915,11 @@ function confirmPlan(id) {
     d.prepare(`UPDATE lead_plans
       SET status = 'confirmed', material_name = ?, confirmed_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND status = 'draft'`).run(mat.name, id);
+    // 台账：确认只增加净预留，实物库存不变（同事务写入）
+    appendLedgerInTx(d, 'lead', row.material_id, 'plan_confirm', {
+      sourceType: 'plan', sourceId: id, sourceRef: `生产计划 #${id} 确认（${mat.name}）`,
+    }, { stockChange: 0, reserveChange: row.required_bars },
+    { stock: mat.stock, reserved: leadNetReservedInTx(row.material_id) });
     d.exec('COMMIT');
     return { code: 'ok', plan: getPlan(id) };
   } catch (e) {
@@ -716,9 +939,18 @@ function cancelPlan(id) {
   if (planHasIssues(row.id)) return { code: 'already_issued', picked: leadPickedForPlan(row.id) };
   d.exec('BEGIN IMMEDIATE');
   try {
-    d.prepare(`UPDATE lead_plans
+    const updated = d.prepare(`UPDATE lead_plans
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND status = 'confirmed'`).run(id);
+    // 台账：取消释放净预留（同事务写入）；正常路径 changes=1
+    if (updated.changes === 1) {
+      const plan = getPlanRow(id);
+      const mat = getMaterialRow(plan.material_id);
+      appendLedgerInTx(d, 'lead', plan.material_id, 'plan_cancel', {
+        sourceType: 'plan', sourceId: id, sourceRef: `生产计划 #${id} 取消（${plan.material_name}）`,
+      }, { stockChange: 0, reserveChange: -plan.required_bars },
+      { stock: mat ? mat.stock : 0, reserved: leadNetReservedInTx(plan.material_id) });
+    }
     d.exec('COMMIT');
     return { code: 'ok', plan: getPlan(id) };
   } catch (e) {
@@ -823,13 +1055,25 @@ function getGlassSheet(id) {
 }
 
 function createGlassSheet({ color, width, height, stock }) {
-  const info = getDb()
-    .prepare('INSERT INTO glass_sheets (color, width_mm, height_mm, stock) VALUES (?, ?, ?, ?)')
-    .run(color, width, height, stock);
-  return getGlassSheet(info.lastInsertRowid);
+  const d = getDb();
+  const txn = d.transaction(() => {
+    const info = d
+      .prepare('INSERT INTO glass_sheets (color, width_mm, height_mm, stock) VALUES (?, ?, ?, ?)')
+      .run(color, width, height, stock);
+    const id = info.lastInsertRowid;
+    // 新登记规格从登记余额起记账（实物=登记库存，净预留=0）
+    appendLedgerInTx(d, 'glass', id, 'register', {
+      sourceType: 'register', sourceRef: `原片登记（${color} ${width}×${height}mm）`,
+      specWidthMm: width, specHeightMm: height,
+    }, { stockChange: stock, reserveChange: 0 }, { stock, reserved: 0 });
+    return id;
+  });
+  const id = txn.immediate();
+  return getGlassSheet(id);
 }
 
 // 仅允许调整库存张数（颜色/宽高均属规格身份）；库存不得低于已确认订单预留。
+// 调库与台账写入在同一事务。
 function updateGlassSheetStock(id, stock) {
   const d = getDb();
   const txn = d.transaction(() => {
@@ -842,6 +1086,12 @@ function updateGlassSheetStock(id, stock) {
     const reserved = gross - glassPickedForSheet(id);
     if (stock < reserved) return { code: 'stock_below_reserved', reserved };
     d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
+    if (stock !== row.stock) {
+      appendLedgerInTx(d, 'glass', id, 'adjust', {
+        sourceType: 'adjust', sourceRef: `手工调库（${row.color} 原片）`,
+      }, { stockChange: stock - row.stock, reserveChange: 0 },
+      { stock, reserved });
+    }
     return { code: 'ok', sheet: getGlassSheet(id) };
   });
   return txn.immediate();
@@ -987,6 +1237,16 @@ function confirmCutOrder(id) {
     d.prepare(`UPDATE cut_orders
       SET status = 'confirmed', confirmed_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND status = 'draft'`).run(id);
+    // 台账：逐色增加净预留（按 cut_order_items 顺序，同事务写入，共用 event_id）
+    const evId = beginLedgerEvent(d);
+    items.forEach((it, idx) => {
+      const sheet = getGlassSheetRow(it.sheet_id);
+      appendLedgerInTx(d, 'glass', it.sheet_id, 'order_confirm', {
+        sourceType: 'order', sourceId: id,
+        sourceRef: `裁片订单 #${id} 确认（${it.sheet_color}）`,
+      }, { stockChange: 0, reserveChange: it.required_sheets },
+      { stock: sheet ? sheet.stock : 0, reserved: glassNetReservedInTx(it.sheet_id) }, 1, evId);
+    });
     d.exec('COMMIT');
     return { code: 'ok', order: getCutOrder(id) };
   } catch (e) {
@@ -1007,9 +1267,22 @@ function cancelCutOrder(id) {
   if (orderHasIssues(row.id)) return { code: 'already_issued' };
   d.exec('BEGIN IMMEDIATE');
   try {
-    d.prepare(`UPDATE cut_orders
+    const updated = d.prepare(`UPDATE cut_orders
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND status = 'confirmed'`).run(id);
+    if (updated.changes === 1) {
+      // 台账：逐色释放净预留（同事务写入，共用 event_id）
+      const items = d.prepare('SELECT * FROM cut_order_items WHERE order_id = ? ORDER BY id').all(id);
+      const evId = beginLedgerEvent(d);
+      items.forEach((it) => {
+        const sheet = getGlassSheetRow(it.sheet_id);
+        appendLedgerInTx(d, 'glass', it.sheet_id, 'order_cancel', {
+          sourceType: 'order', sourceId: id,
+          sourceRef: `裁片订单 #${id} 取消（${it.sheet_color}）`,
+        }, { stockChange: 0, reserveChange: -it.required_sheets },
+        { stock: sheet ? sheet.stock : 0, reserved: glassNetReservedInTx(it.sheet_id) }, 1, evId);
+      });
+    }
     d.exec('COMMIT');
     return { code: 'ok', order: getCutOrder(id) };
   } catch (e) {
@@ -1151,6 +1424,43 @@ function replaceCutOrder(oldId, o) {
     d.prepare(`INSERT INTO cut_order_replacements
       (old_order_id, new_order_id, target_publication_id, copies, gap_mm)
       VALUES (?, ?, ?, ?, ?)`).run(oldId, newId, o.targetPublicationId, o.copies, o.gap);
+
+    // 台账（同事务，共用 event_id）：旧单退出预留（replace_release）→ 新单承接预留（replace_reserve）。
+    // 笔后余额按“换单前该规格净预留（含旧单、不含尚未提交的新单）+ 已处理增减”逐笔滚动计算。
+    // 注意：此刻新单已插入为 confirmed、旧单已置 replaced，不能再读聚合函数，需先固化换单前余额。
+    const oldItems = d.prepare('SELECT * FROM cut_order_items WHERE order_id = ? ORDER BY id').all(oldId);
+    const startReservedBySheet = new Map();
+    const otherReservedForReplacement = (sheetId) => d.prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
+      FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
+      WHERE ci.sheet_id = ? AND co.status = 'confirmed' AND co.id NOT IN (?, ?)`)
+      .get(sheetId, oldId, newId).n - glassPickedForSheet(sheetId);
+    for (const it of oldItems) {
+      startReservedBySheet.set(it.sheet_id, otherReservedForReplacement(it.sheet_id) + it.required_sheets);
+    }
+    for (const it of o.items) {
+      if (!startReservedBySheet.has(it.sheetId)) startReservedBySheet.set(it.sheetId, otherReservedForReplacement(it.sheetId));
+    }
+    const evId = beginLedgerEvent(d);
+    for (const it of oldItems) {
+      const sheet = getGlassSheetRow(it.sheet_id);
+      const afterRelease = startReservedBySheet.get(it.sheet_id) - it.required_sheets;
+      startReservedBySheet.set(it.sheet_id, afterRelease);
+      appendLedgerInTx(d, 'glass', it.sheet_id, 'replace_release', {
+        sourceType: 'replacement', sourceId: newId,
+        sourceRef: `裁片换单：旧订单 #${oldId} 退出预留 → 新订单 #${newId}（${it.sheet_color}）`,
+      }, { stockChange: 0, reserveChange: -it.required_sheets },
+      { stock: sheet ? sheet.stock : 0, reserved: afterRelease }, 1, evId);
+    }
+    for (const it of o.items) {
+      const sheet = getGlassSheetRow(it.sheetId);
+      const afterReserve = startReservedBySheet.get(it.sheetId) + it.requiredSheets;
+      startReservedBySheet.set(it.sheetId, afterReserve);
+      appendLedgerInTx(d, 'glass', it.sheetId, 'replace_reserve', {
+        sourceType: 'replacement', sourceId: newId,
+        sourceRef: `裁片换单：新订单 #${newId} 承接预留（替代 #${oldId}，${it.color}）`,
+      }, { stockChange: 0, reserveChange: it.requiredSheets },
+      { stock: sheet ? sheet.stock : 0, reserved: afterReserve }, 2, evId);
+    }
 
     d.exec('COMMIT');
     return { code: 'ok', order: getCutOrder(newId), newOrderId: newId };
@@ -1320,6 +1630,25 @@ function createComboOrder(c) {
     d.prepare('UPDATE lead_plans SET combo_id = ? WHERE id = ?').run(comboId, planId);
     d.prepare('UPDATE cut_orders SET combo_id = ? WHERE id = ?').run(comboId, orderId);
 
+    // 台账（同事务，共用 event_id）：整套确认，铅条 + 逐色玻璃净预留各一笔
+    {
+      const evId = beginLedgerEvent(d);
+      const matRow = getMaterialRow(c.materialId);
+      appendLedgerInTx(d, 'lead', c.materialId, 'combo_confirm', {
+        sourceType: 'combo', sourceId: comboId,
+        sourceRef: `整套用料单 #${comboId} 确认（${c.materialName}）`,
+      }, { stockChange: 0, reserveChange: c.requiredBars },
+      { stock: matRow ? matRow.stock : 0, reserved: leadNetReservedInTx(c.materialId) }, 1, evId);
+      c.items.forEach((it, idx) => {
+        const sheet = getGlassSheetRow(it.sheetId);
+        appendLedgerInTx(d, 'glass', it.sheetId, 'combo_confirm', {
+          sourceType: 'combo', sourceId: comboId,
+          sourceRef: `整套用料单 #${comboId} 确认（${it.color}）`,
+        }, { stockChange: 0, reserveChange: it.requiredSheets },
+        { stock: sheet ? sheet.stock : 0, reserved: glassNetReservedInTx(it.sheetId) }, 1, evId);
+      });
+    }
+
     d.exec('COMMIT');
     return { code: 'ok', combo: getComboOrder(comboId) };
   } catch (e) {
@@ -1360,6 +1689,30 @@ function cancelComboOrder(id) {
     d.prepare(`UPDATE combo_orders
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ?`).run(id);
+
+    // 台账（同事务，共用 event_id）：铅条与逐色玻璃净预留各释放一次
+    {
+      const evId = beginLedgerEvent(d);
+      const plan = getPlanRow(cur.lead_plan_id);
+      const matRow = plan ? getMaterialRow(plan.material_id) : null;
+      if (plan) {
+        appendLedgerInTx(d, 'lead', plan.material_id, 'combo_cancel', {
+          sourceType: 'combo', sourceId: id,
+          sourceRef: `整套用料单 #${id} 取消（${plan.material_name}）`,
+        }, { stockChange: 0, reserveChange: -plan.required_bars },
+        { stock: matRow ? matRow.stock : 0, reserved: leadNetReservedInTx(plan.material_id) }, 1, evId);
+      }
+      const items = d.prepare('SELECT * FROM cut_order_items WHERE order_id = ? ORDER BY id').all(cur.cut_order_id);
+      items.forEach((it) => {
+        const sheet = getGlassSheetRow(it.sheet_id);
+        appendLedgerInTx(d, 'glass', it.sheet_id, 'combo_cancel', {
+          sourceType: 'combo', sourceId: id,
+          sourceRef: `整套用料单 #${id} 取消（${it.sheet_color}）`,
+        }, { stockChange: 0, reserveChange: -it.required_sheets },
+        { stock: sheet ? sheet.stock : 0, reserved: glassNetReservedInTx(it.sheet_id) }, 1, evId);
+      });
+    }
+
     d.exec('COMMIT');
     return { code: 'ok', combo: getComboOrder(id) };
   } catch (e) {
@@ -1575,15 +1928,26 @@ function confirmStocktake(id) {
     }
 
     // 全部通过：一次更新各规格库存（独立计划、裁片订单与整套单随后按盘点后库存计算可用量）
-    for (const it of itemRows) {
+    const stEvId = beginLedgerEvent(d);
+    itemRows.forEach((it) => {
       if (it.type === 'lead') {
         d.prepare("UPDATE lead_materials SET stock = ?, updated_at = datetime('now') WHERE id = ?")
           .run(it.counted_stock, it.spec_id);
+        appendLedgerInTx(d, 'lead', it.spec_id, 'stocktake', {
+          sourceType: 'stocktake', sourceId: id,
+          sourceRef: `盘点单 #${id} 确认（${it.spec_name}，原 ${it.baseline_stock} → ${it.counted_stock}）`,
+        }, { stockChange: it.counted_stock - it.baseline_stock, reserveChange: 0 },
+        { stock: it.counted_stock, reserved: leadReservedFor(it.spec_id) }, 1, stEvId);
       } else {
         d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?")
           .run(it.counted_stock, it.spec_id);
+        appendLedgerInTx(d, 'glass', it.spec_id, 'stocktake', {
+          sourceType: 'stocktake', sourceId: id,
+          sourceRef: `盘点单 #${id} 确认（${it.spec_name}，原 ${it.baseline_stock} → ${it.counted_stock}）`,
+        }, { stockChange: it.counted_stock - it.baseline_stock, reserveChange: 0 },
+        { stock: it.counted_stock, reserved: glassReservedFor(it.spec_id) }, 1, stEvId);
       }
-    }
+    });
     d.prepare(`UPDATE stocktakes SET status = 'confirmed', confirmed_at = datetime('now'),
       updated_at = datetime('now') WHERE id = ?`).run(id);
     d.exec('COMMIT');
@@ -1897,6 +2261,27 @@ function createStockIssue(p) {
       if (firstId === null) firstId = info.lastInsertRowid;
     }
 
+    // 台账（同事务，共用 event_id）：领料同时扣减实物库存与净预留（二者同减），来源记领料号。
+    // 同一事件内铅条 seq=1、玻璃 seq=2；每个规格各自只看到自己的行，逐笔可顺序核对。
+    const issueEvId = beginLedgerEvent(d);
+    if (p.leadBars > 0) {
+      const matRow = getMaterialRow(planRow.material_id);
+      appendLedgerInTx(d, 'lead', planRow.material_id, 'issue', {
+        sourceType: 'issue', sourceRef: `领料 ${p.issueNo}（${p.sourceType === 'combo' ? '整套单' : '计划'} #${planRow.id}）`,
+      }, { stockChange: -p.leadBars, reserveChange: -p.leadBars },
+      { stock: matRow ? matRow.stock : 0, reserved: leadNetReservedInTx(planRow.material_id) }, 1, issueEvId);
+    }
+    for (const [sheetId, count] of glassDedup) {
+      const item = itemBySheet.get(sheetId);
+      const sheetRow = getGlassSheetRow(sheetId);
+      const srcId = comboRow ? comboRow.id : orderRow.id;
+      appendLedgerInTx(d, 'glass', sheetId, 'issue', {
+        sourceType: 'issue', sourceId: srcId,
+        sourceRef: `领料 ${p.issueNo}（${p.sourceType === 'combo' ? '整套单' : '订单'} #${srcId}，${item ? item.sheet_color : ''}）`,
+      }, { stockChange: -count, reserveChange: -count },
+      { stock: sheetRow ? sheetRow.stock : 0, reserved: glassNetReservedInTx(sheetId) }, 2, issueEvId);
+    }
+
     d.exec('COMMIT');
     return { code: 'ok', id: firstId, issueNo: p.issueNo };
   } catch (e) {
@@ -1988,4 +2373,5 @@ module.exports = {
   createStockIssue, getIssueRowsByNo, listIssueRows, listAllIssueRows,
   leadPickedForMaterial, glassPickedForSheet, leadPickedForPlan, glassPickedForOrderSheet,
   orderHasIssues, planHasIssues, getPlanIssueStats, getOrderIssueStats, getComboIssueStats,
+  listStockLedger, ledgerOpening,
 };

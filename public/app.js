@@ -714,6 +714,7 @@ function switchTab(which) {
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
   document.getElementById('tabIssue').classList.toggle('active', which === 'issue');
+  document.getElementById('tabLedger').classList.toggle('active', which === 'ledger');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
@@ -723,6 +724,7 @@ function switchTab(which) {
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
   document.getElementById('viewIssue').hidden = which !== 'issue';
+  document.getElementById('viewLedger').hidden = which !== 'ledger';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
@@ -731,6 +733,7 @@ function switchTab(which) {
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
   if (which === 'issue') enterIssue();
+  if (which === 'ledger') enterLedger();
 }
 
 (async function init() {
@@ -2986,3 +2989,145 @@ document.getElementById('btnIssueSubmit').addEventListener('click', () => { issu
 document.getElementById('btnIssueNewNo').addEventListener('click', () => {
   document.getElementById('issueNo').value = genIssueNo();
 });
+
+// ================= 库存台账 =================
+
+const ledgerState = { specs: { lead: [], glass: [] } };
+
+function ledgerBanner(kind, msg) {
+  const b = document.getElementById('ledgerBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+}
+
+const LEDGER_EVENT_ZH = {
+  baseline: { text: '基线', cls: 'neutral' },
+  register: { text: '登记', cls: 'ok' },
+  adjust: { text: '调库', cls: 'neutral' },
+  plan_confirm: { text: '计划确认', cls: 'ok' },
+  plan_cancel: { text: '计划取消', cls: 'warn' },
+  order_confirm: { text: '订单确认', cls: 'ok' },
+  order_cancel: { text: '订单取消', cls: 'warn' },
+  replace_release: { text: '换单退出', cls: 'warn' },
+  replace_reserve: { text: '换单承接', cls: 'ok' },
+  combo_confirm: { text: '整套确认', cls: 'ok' },
+  combo_cancel: { text: '整套取消', cls: 'warn' },
+  stocktake: { text: '盘点', cls: 'neutral' },
+  issue: { text: '领料', cls: 'warn' },
+};
+
+function ledgerSpecLabel(type, s) {
+  if (type === 'lead') return `#${s.id} ${s.name}（${s.length}mm）`;
+  const color = s.color || '';
+  return `#${s.id} ${color} ${s.width}×${s.height}mm`;
+}
+
+async function ledgerLoadSpecs() {
+  const type = document.getElementById('ledgerType').value;
+  const sel = document.getElementById('ledgerSpec');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (type === 'lead') {
+    ledgerState.specs.lead = (await api('GET', '/api/materials')).materials;
+    for (const m of ledgerState.specs.lead) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = ledgerSpecLabel('lead', m);
+      sel.appendChild(opt);
+    }
+  } else {
+    ledgerState.specs.glass = (await api('GET', '/api/glass-sheets')).sheets;
+    for (const s of ledgerState.specs.glass) {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      const chip = document.createElement('span');
+      opt.textContent = ledgerSpecLabel('glass', s);
+      sel.appendChild(opt);
+    }
+  }
+  if (!sel.options.length) {
+    sel.innerHTML = '<option value="">（请先在对应标签登记规格）</option>';
+  } else if ([...sel.options].some((o) => o.value === prev)) {
+    sel.value = prev;
+  }
+}
+
+function ledgerDeltaHtml(n, zero) {
+  if (n === 0) return `<span class="muted">${zero}</span>`;
+  const cls = n > 0 ? 'delta-up' : 'delta-down';
+  return `<b class="${cls}">${n > 0 ? '+' : ''}${n}</b>`;
+}
+
+function ledgerRowHtml(e) {
+  const meta = LEDGER_EVENT_ZH[e.eventType] || { text: e.eventType, cls: 'neutral' };
+  return `<tr>
+    <td>${e.occurredAt}</td>
+    <td><span class="badge ${meta.cls}">${meta.text}</span></td>
+    <td class="ledger-ref">${escapeHtml(e.sourceRef || '—')}</td>
+    <td class="num">${ledgerDeltaHtml(e.stockChange, '·')}</td>
+    <td class="num">${ledgerDeltaHtml(e.reserveChange, '·')}</td>
+    <td class="num"><b>${e.stockBalance}</b></td>
+    <td class="num"><b>${e.reserveBalance}</b></td>
+  </tr>`;
+}
+
+async function ledgerQuery() {
+  ledgerBanner(false);
+  const type = document.getElementById('ledgerType').value;
+  const specId = Number(document.getElementById('ledgerSpec').value);
+  if (!specId) { ledgerBanner('error', '请先登记并选择一个规格。'); return; }
+  const from = document.getElementById('ledgerFrom').value;
+  const to = document.getElementById('ledgerTo').value;
+  const qs = new URLSearchParams({ type, specId: String(specId) });
+  if (from) qs.set('from', from);
+  if (to) qs.set('to', to);
+  let data;
+  try {
+    data = await api('GET', '/api/stock-ledger?' + qs.toString());
+  } catch (err) {
+    ledgerBanner('error', '⛔ ' + escapeHtml(err.message));
+    return;
+  }
+  const spec = data.spec;
+  const cur = data.current;
+  document.getElementById('ledgerCurrent').innerHTML = `
+    <div class="ledger-current">
+      <div>${type === 'lead'
+        ? `铅条规格：<b>${escapeHtml(spec.name)}</b>（定尺 ${spec.length} mm）`
+        : `玻璃原片：<span class="color-chip" style="background:${spec.color}"></span><b>${spec.color}</b> ${spec.width}×${spec.height}mm`}</div>
+      <div>当前实物库存：<b>${cur.stock}</b>；净预留：<b>${cur.reserved}</b>；可用：<b>${cur.available}</b></div>
+      <div class="muted small">区间期初：实物 ${data.opening.stock} / 净预留 ${data.opening.reserved}；
+        逐笔顺序核对：${data.sequential ? '✓ 通过' : '✗ 不一致'}；末笔对当前余额：${data.tailMatches ? '✓ 相符' : '✗ 不符'}</div>
+    </div>`;
+  const box = document.getElementById('ledgerResult');
+  if (!data.entries.length) {
+    box.innerHTML = '<div class="hint">所选范围内没有台账记录（空结果）。</div>';
+    return;
+  }
+  box.innerHTML = `<table class="ledger-table">
+    <thead><tr>
+      <th>发生时间 (UTC)</th><th>业务</th><th>业务来源</th>
+      <th title="实物库存增减">实物增减</th><th title="净预留增减">净预留增减</th>
+      <th>笔后实物</th><th>笔后净预留</th>
+    </tr></thead>
+    <tbody>${data.entries.map(ledgerRowHtml).join('')}</tbody>
+  </table>
+  <div class="hint small">净预留＝已确认单据预留 − 已领出；+ 为增加、− 为减少，“·”表示本笔不涉及该项。同一业务事件涉及多规格时按事件分组，各规格流水各自连续。</div>`;
+}
+
+async function enterLedger() {
+  await ledgerLoadSpecs();
+  await ledgerQuery();
+}
+
+document.getElementById('tabLedger').addEventListener('click', () => switchTab('ledger'));
+document.getElementById('ledgerType').addEventListener('change', async () => {
+  await ledgerLoadSpecs();
+  await ledgerQuery();
+});
+document.getElementById('ledgerSpec').addEventListener('change', ledgerQuery);
+document.getElementById('btnLedgerQuery').addEventListener('click', () => { ledgerQuery().catch((e) => ledgerBanner('error', '⛔ ' + e.message)); });
+document.getElementById('ledgerFrom').addEventListener('change', ledgerQuery);
+document.getElementById('ledgerTo').addEventListener('change', ledgerQuery);
